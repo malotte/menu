@@ -1,0 +1,12 @@
+{application, menu,
+ [
+  {description, ""},
+  {vsn, git},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { menu, []}},
+  {env, []}
+ ]}.
