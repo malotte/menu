@@ -90,7 +90,7 @@ menu_loop(SpecStack, DbStack, KeyStack, Output, Input) ->
 		    NewDb = update_db(hd(KeyStack), SubDb, Db, KeyStack),
 		    menu_loop(pop(SpecStack), [NewDb| Rest],
 			      pop(KeyStack), Output, Input);
-		[Db] ->
+		[_Db] ->
 		    %% already at top level, repeat instead
 		     menu_loop(SpecStack, DbStack, KeyStack, Output, Input)
 	    end;
@@ -150,6 +150,15 @@ handle_input(Choice, Spec, Db, KeyStack) ->
 	    set(split(Key), Value, Spec, Db, KeyStack);
 	["unset", Key] -> 
 	    unset(split(Key), Spec, Db, KeyStack);
+	["insert", Position, Key, Value] when Position =:= "before";
+					      Position =:= "after";
+					      Position =:= "first";
+					      Position =:= "last" -> 
+	    insert(split(Key), Position, Value, Spec, Db, KeyStack);
+	["insert", Position, Value] when Position =:= "first";
+					 Position =:= "last" -> 
+	    %% Must be on leaf_list level
+	    insert([0], Position, Value, Spec, Db, KeyStack);
 	["delete", Key] -> 
 	    delete(split(Key), Spec, Db, KeyStack);
 	[Key] ->
@@ -190,34 +199,17 @@ leaf_list_spec(Key, [_Value | Rest], TS, N, Acc) ->
     leaf_list_spec(Key, Rest, TS, N+1, [{list_item, N, TS} | Acc]).
 	
 
-set([N], Value, [{list_items, Key, TS}], Db, KeyStack) ->
+set([N], Value, [{list_items, _Key, TS}], List, KeyStack) ->
     %% list_items case
-    lager:debug("set: ~p = ~p, ~p, ~p, ~p", [N, Value, TS, Db, KeyStack]),
-    case verify_type(Value, TS) of
-	{true, X} ->
-	    {stay, update_list(N, X, Db, KeyStack)};
-	false ->
-	    {error, illegal_type}
-    end;
+    set_list_item(N, Value, TS, List, KeyStack);
+
 set([Key], Value, Spec, Db, KeyStack) ->
     lager:debug("set: ~p = ~p, ~p, ~p, ~p", [Key, Value, Spec, Db, KeyStack]),
     case lists:keyfind(Key, 2, Spec) of
 	{item, Key, TS} ->
-	    lager:debug("set: found item ~p with spec ~p", [Key, TS]),
-	    case verify_type(Value, TS) of
-		{true, X} ->
-		    {stay, update_db(Key, X, Db, KeyStack)};
-		false ->
-		    {error, illegal_type}
-	    end;
+	    set_item(Key, Value, TS, Db, KeyStack);
 	{list_items, _, TS} ->
-	    lager:debug("set: found list items with spec ~p", [TS]),
-	    case verify_type(Value, TS) of
-		{true, X} ->
-		    {stay, update_list(Key, X, Db, KeyStack)};
-		false ->
-		    {error, illegal_type}
-	    end;
+	    set_list_item(Key, Value, TS, Db, KeyStack);
 	_O ->
 	    lager:debug("set: unknown item ~p = ~p", [Key, _O]),
 	    {error, unknown_item}		
@@ -225,40 +217,75 @@ set([Key], Value, Spec, Db, KeyStack) ->
 set([Key | Rest] = KeyList, Value, Spec, Db, KeyStack) ->
     lager:debug("set: ~p = ~p, ~p, ~p, ~p", [KeyList, Value, Spec, Db, KeyStack]),
     case lists:keyfind(Key, 2, Spec) of
-	{Qualifier, Key, SubSpec} when Qualifier =:= menu ->
-	    lager:debug("set: found ~p with spec ~p", [Key, SubSpec]),
-    	    case find_in_db(Key, Db) of
-		{Key, SubDb} -> 
-		    lager:debug("set: found ~p with db ~p", [Key, SubDb]),
-		    case set(Rest, Value, SubSpec, SubDb, push(Key, KeyStack)) of
-			{error, _Reason} = E ->
-			    E;
-			{stay, NewDb} ->
-			    {stay, update_db(Key, NewDb, Db, KeyStack)}
-		    end;
-		false -> 
-		    lager:debug("set: ~p not found in db", [Key]),
-		    %% Add 
-		    set(KeyList, Value, Spec, 
-			add_to_db(Key, SubSpec, Db, KeyStack), KeyStack)
-	    end;
+	{menu, Key, SubSpec} ->
+	    set_menu(KeyList, Value, Spec, SubSpec, Db, KeyStack);
 	{leaf_list, Key, TS} ->
-	    lager:debug("set: found leaf list ~p with spec ~p", [Key, TS]),
-	    %% Rest must be [N] ??
-	    case verify_type(Value, TS) of
-		{true, X} ->
-		    {stay, update_list_in_db(hd(Rest), X, Db, push(Key, KeyStack))};
-		false ->
-		    {error, illegal_type}
-	    end;
-	    
+	    set_leaf_list(Key, Rest, Value, TS, Spec, Db, KeyStack);	    
 	_O ->
 	    lager:debug("set: unknown item ~p = ~p", [Key, _O]),
 	    {error, unknown_item}		
     end.
 
+set_item(Key, Value, TS, Db, KeyStack) ->
+    lager:debug("set: found item ~p with spec ~p", [Key, TS]),
+    case verify_type(Value, TS) of
+	{true, X} ->
+	    {stay, update_db(Key, X, Db, KeyStack)};
+	false ->
+	    {error, illegal_type}
+    end.
+
+set_list_item(N, Value, TS, List, KeyStack) ->
+    lager:debug("set: found list items with spec ~p", [TS]),
+    case verify_type(Value, TS) of
+	{true, X} ->
+	   case length(List) of
+	       I when I >= N ->
+		    {stay, update_list(N, X, List, KeyStack)};
+	       I when I < N ->
+		   {error, unknown_item}
+	   end;
+	false ->
+	    {error, illegal_type}
+    end.
+
+set_menu([Key | Rest] = KeyList, Value, Spec, SubSpec, Db, KeyStack) ->
+    lager:debug("set: found ~p with spec ~p", [Key, SubSpec]),
+    case find_in_db(Key, Db) of
+	{Key, SubDb} -> 
+	    lager:debug("set: found ~p with db ~p", [Key, SubDb]),
+	    case set(Rest, Value, SubSpec, SubDb, push(Key, KeyStack)) of
+		{error, _Reason} = E ->
+		    E;
+		{stay, NewDb} ->
+		    {stay, update_db(Key, NewDb, Db, KeyStack)}
+	    end;
+	false -> 
+	    lager:debug("set: ~p not found in db", [Key]),
+	    %% Add 
+	    set(KeyList, Value, Spec, 
+		add_to_db(Key, SubSpec, Db, KeyStack), KeyStack)
+    end.
+
+set_leaf_list(Key, Rest, Value, TS, Spec, Db, KeyStack) ->
+    lager:debug("set: found leaf list ~p with spec ~p", [Key, TS]),
+    %% Rest must be [N] ??
+    case verify_type(Value, TS) of
+	{true, X} ->
+	    case update_list_in_db(hd(Rest), X, Db, 
+				   push(Key, KeyStack)) of
+		{error, _Reason} = E ->
+		    E;
+		NewDb ->	
+		    {stay, NewDb}
+	    end;
+	false ->
+	    {error, illegal_type}
+    end.
+
+
 unset([Key], Spec, Db, KeyStack) ->
-   lager:debug("unset: ~p, ~p, ~p, ~p", [Key, Spec, Db, KeyStack]),
+    lager:debug("unset: ~p, ~p, ~p, ~p", [Key, Spec, Db, KeyStack]),
     case lists:keyfind(Key, 2, Spec) of
 	{item, Key, TS} ->
 	    lager:debug("unset: found item ~p with spec ~p", [Key, TS]),
@@ -267,53 +294,135 @@ unset([Key], Spec, Db, KeyStack) ->
 	    lager:debug("unset: unknown item ~p = ~p", [Key, _O]),
 	    {error, unknown_item}		
     end;
-unset([Key | Rest] = KeyList, Spec, Db, KeyStack) ->
+unset([Key | _Rest] = KeyList, Spec, Db, KeyStack) ->
     lager:debug("unset: ~p, ~p, ~p, ~p", [KeyList, Spec, Db, KeyStack]),
     case lists:keyfind(Key, 2, Spec) of
 	{menu, Key, SubSpec} ->
-	    lager:debug("unset: found ~p with spec ~p", [Key, SubSpec]),
-    	    case find_in_db(Key, Db) of
-		{Key, SubDb} -> 
-		    lager:debug("unset: found ~p with db ~p", [Key, SubDb]),
-		    case unset(Rest, SubSpec, SubDb, push(Key, KeyStack)) of
-			{error, _Reason} = E ->
-			    E;
-			{stay, NewDb} ->
-			    {stay, update_db(Key, NewDb, Db, KeyStack)}
-		    end;
-		false -> 
-		    lager:debug("unset: ~p not found in db", [Key]),
-		    {error, unknown_item}
-	    end;
+	    unset_menu(KeyList, Spec, SubSpec, Db, KeyStack);
 	_O ->
 	    lager:debug("unset: unknown item ~p = ~p", [Key, _O]),
 	    {error, unknown_item}		
     end.
 
-delete([N], [{list_items, Key, TS}], Db, KeyStack) ->
+unset_menu([Key | Rest], Spec, SubSpec, Db, KeyStack) ->
+    lager:debug("unset: found ~p with spec ~p", [Key, SubSpec]),
+    case find_in_db(Key, Db) of
+	{Key, SubDb} -> 
+	    lager:debug("unset: found ~p with db ~p", [Key, SubDb]),
+	    case unset(Rest, SubSpec, SubDb, push(Key, KeyStack)) of
+		{error, _Reason} = E ->
+		    E;
+		{stay, NewDb} ->
+		    {stay, update_db(Key, NewDb, Db, KeyStack)}
+	    end;
+	false -> 
+	    lager:debug("unset: ~p not found in db", [Key]),
+	    {error, unknown_item}
+    end.
+
+insert([N], Position, Value, [{list_items, _Key, TS}], List, KeyStack) ->
+    insert_list_item(N, Position, Value, TS, List, KeyStack);
+insert([Key], Position, Value, Spec, Db, KeyStack) ->
+    lager:debug("insert: ~p = ~p, ~p, ~p, ~p", 
+		[Key, Value, Spec, Db, KeyStack]),
+    case lists:keyfind(Key, 2, Spec) of
+	{item, Key, TS} ->
+	    insert_item(Key, Position, Value, TS, Db, KeyStack);
+	{list_items, _, TS} ->
+	    insert_list_item(Key, Position, Value, TS, Db, KeyStack);
+	_O ->
+	    lager:debug("insert: unknown item ~p = ~p", [Key, _O]),
+	    {error, unknown_item}		
+    end;
+insert([Key | Rest] = KeyList, Position, Value, Spec, Db, KeyStack) ->
+    lager:debug("insert: ~p = ~p, ~p, ~p, ~p", [KeyList, Value, Spec, Db, KeyStack]),
+    case lists:keyfind(Key, 2, Spec) of
+	{menu, Key, SubSpec} ->
+	    insert_menu(KeyList, Position, Value, Spec, SubSpec, Db, KeyStack);
+	{leaf_list, Key, TS} ->
+	    insert_leaf_list(KeyList, Position, Value, TS, Spec, Db, KeyStack);
+	_O ->
+	    lager:debug("insert: unknown item ~p = ~p", [Key, _O]),
+	    {error, unknown_item}		
+    end.
+
+insert_item(Key, Position, Value, TS, Db, KeyStack) ->
+    lager:debug("insert: found item ~p with spec ~p", [Key, TS]),
+    case verify_type(Value, TS) of
+	{true, X} ->
+	    {stay, add_to_list_in_db(Key, Position, X, Db, KeyStack)};
+	false ->
+	    {error, illegal_type}
+    end.
+
+insert_list_item(N, Position, Value, TS, List, KeyStack) ->
+    lager:debug("insert: ~p = ~p, ~p, ~p, ~p", [N, Value, TS, List, KeyStack]),
+    case verify_type(Value, TS) of
+	{true, X} ->
+	   case length(List) of
+	       I when I >= N ->
+		    {stay, add_to_list(N, Position, X, List, KeyStack)};
+	       I when I < N ->
+		   {error, unknown_item}
+	   end;
+	false ->
+	    {error, illegal_type}
+    end.
+
+insert_menu([Key | Rest] = KeyList, Position, Value, Spec, SubSpec, Db, KeyStack) ->
+    lager:debug("insert: found ~p with spec ~p", [Key, SubSpec]),
+    case find_in_db(Key, Db) of
+	{Key, SubDb} -> 
+	    lager:debug("insert: found ~p with db ~p", [Key, SubDb]),
+	    case insert(Rest, Position, Value, SubSpec, SubDb, push(Key, KeyStack)) of
+		{error, _Reason} = E ->
+		    E;
+		{stay, NewDb} ->
+		    {stay, update_db(Key, NewDb, Db, KeyStack)}
+	    end;
+	false -> 
+	    lager:debug("insert: ~p not found in db", [Key]),
+	    %% Add 
+	    insert(KeyList, Position, Value, Spec, 
+		   add_to_db(Key, SubSpec, Db, KeyStack), KeyStack)
+    end.
+
+insert_leaf_list([Key | Rest], Position, Value, TS, Spec, Db, KeyStack) ->
+    lager:debug("insert: found leaf list ~p with spec ~p", [Key, TS]),
+    case verify_type(Value, TS) of
+	{true, X} ->
+	    %% Rest must be [N] ??
+	    case add_to_list_in_db(hd(Rest), Position, X, Db, 
+				   push(Key, KeyStack)) of
+		{error, _Reason} = E ->
+		    E;
+		NewDb ->	
+		    {stay, NewDb}
+	    end;
+	false ->
+	    {error, illegal_type}
+    end.
+
+delete([N], [{list_items, _Key, TS}], Db, KeyStack) ->
     lager:debug("delete: ~p, ~p, ~p, ~p", [N, TS, Db, KeyStack]),
     {stay, delete_from_list(N, Db, KeyStack)};
 delete([Key], Spec, Db, KeyStack) ->
-    lager:debug("delete: unknown list item ~p = ~p", [Key, Spec]),
-    {error, unknown_list_item};
+   lager:debug("delete: ~p, ~p, ~p, ~p", [Key, Spec, Db, KeyStack]),
+    case lists:keyfind(Key, 2, Spec) of
+	{item, Key, TS} ->
+	    lager:debug("delete: found item ~p with spec ~p", [Key, TS]),
+	    {stay, remove_from_db(Key, TS, Db, KeyStack)};
+	_O ->
+	    lager:debug("delete: unknown item ~p = ~p", [Key, _O]),
+	    {error, unknown_item}		
+    end;
+%%    lager:debug("delete: unknown list item ~p = ~p", [Key, Spec]),
+%%    {error, unknown_list_item};
 delete([Key | Rest] = KeyList, Spec, Db, KeyStack) ->
     lager:debug("delete: ~p, ~p, ~p, ~p", [KeyList, Spec, Db, KeyStack]),
     case lists:keyfind(Key, 2, Spec) of
 	{menu, Key, SubSpec} ->
-	    lager:debug("delete: found ~p with spec ~p", [Key, SubSpec]),
-    	    case find_in_db(Key, Db) of
-		{Key, SubDb} -> 
-		    lager:debug("delete: found ~p with db ~p", [Key, SubDb]),
-		    case delete(Rest, SubSpec, SubDb, push(Key, KeyStack)) of
-			{error, _Reason} = E ->
-			    E;
-			{stay, NewDb} ->
-			    {stay, update_db(Key, NewDb, Db, KeyStack)}
-		    end;
-		false -> 
-		    lager:debug("delete: ~p not found in db", [Key]),
-		    {error, unknown_item}
-	    end;
+	    delete_menu(KeyList, Spec, SubSpec, Db, KeyStack);
 	{leaf_list, Key, TS} ->
 	    lager:debug("delete: found leaf list ~p with spec ~p", [Key, TS]),
 	    %% Rest must be [N] ??
@@ -321,6 +430,22 @@ delete([Key | Rest] = KeyList, Spec, Db, KeyStack) ->
 	_O ->
 	    lager:debug("delete: unknown item ~p = ~p", [Key, _O]),
 	    {error, unknown_item}		
+    end.
+
+delete_menu([Key | Rest], Spec, SubSpec, Db, KeyStack) ->
+    lager:debug("delete: found ~p with spec ~p", [Key, SubSpec]),
+    case find_in_db(Key, Db) of
+	{Key, SubDb} -> 
+	    lager:debug("delete: found ~p with db ~p", [Key, SubDb]),
+	    case delete(Rest, SubSpec, SubDb, push(Key, KeyStack)) of
+		{error, _Reason} = E ->
+		    E;
+		{stay, NewDb} ->
+		    {stay, update_db(Key, NewDb, Db, KeyStack)}
+	    end;
+	false -> 
+	    lager:debug("delete: ~p not found in db", [Key]),
+	    {error, unknown_item}
     end.
 
 find_in_db(Key, Db) ->
@@ -331,14 +456,6 @@ replace_db(New, []) ->
 replace_db(New, [ Old | Rest]) ->
     lager:debug("replace_db: ~p, ~p, ~p", [New, Old, Rest]),
     [New | Rest].
-
-replace_db([], NewDb, Db) ->
-    lager:debug("replace_db:  ~p = ~p, ~p", [[], NewDb, Db]),
-    NewDb;
-replace_db([Key | _Rest] = _KeyStack, NewDb, Db) ->
-    lager:debug("replace_db:  ~p = ~p, ~p", [_KeyStack, NewDb, Db]),
-    lists:keystore(Key, 1, Db, {Key, NewDb}).
-
 
 update_db(Key, Value, Db, KeyStack) ->
     lager:debug("update_db:  ~p = ~p, ~p, ~p", [Key, Value, Db, KeyStack]),
@@ -358,9 +475,9 @@ remove_from_db(Key, Spec, Db, KeyStack) ->
     lists:keydelete(Key, 1, Db).
  
 delete_from_list(N, List, KeyStack) ->
-    lager:debug("delete_from_list_in_db:  ~p, ~p, ~p", [N, List, KeyStack]),
+    lager:debug("delete_from_list:  ~p, ~p, ~p", [N, List, KeyStack]),
     {Start, [_Remove | End]} = lists:split(N-1, List),
-    NewList = Start ++ End.
+    Start ++ End.
 
 delete_from_list_in_db(N, Db, KeyStack) ->
     lager:debug("delete_from_list_in_db:  ~p, ~p, ~p", [N, Db, KeyStack]),
@@ -369,19 +486,53 @@ delete_from_list_in_db(N, Db, KeyStack) ->
     NewList = Start ++ End,
     lists:keyreplace(Key, 1, Db, {Key, NewList}).
 
+add_to_list(N, Position, Value, List, KeyStack) ->
+    lager:debug("add_to_list: after, ~p = ~p, ~p, ~p", 
+		[N, Value, List, KeyStack]),
+    N1 = case Position of
+	     "after" -> N;
+	     "before" -> N-1;
+	     "first" -> 0;
+	     "last" -> length(List)
+	 end,
+    {Start, End} = lists:split(N1, List),
+    Start ++ [Value] ++ End.
+
 update_list(N, Value, List, KeyStack) ->
-    lager:debug("update_list_in_db:  ~p = ~p, ~p, ~p", 
+    lager:debug("update_list:  ~p = ~p, ~p, ~p", 
 		[N, Value, List, KeyStack]),
     {Start, [_Remove | End]} = lists:split(N-1, List),
-    NewList = Start ++ [Value] ++ End.
+    Start ++ [Value] ++ End.
+
+add_to_list_in_db(N, Position, Value, Db, KeyStack) ->
+    lager:debug("add_to_list_in_db:  ~p = ~p, ~p, ~p", 
+		[N, Value, Db, KeyStack]),
+    {Key, List} = find_in_db(hd(KeyStack), Db), %% Must exist ??
+    N1 = case Position of
+	     "after" -> N;
+	     "before" -> N-1;
+	     "first" -> 0;
+	     "last" -> length(List)
+	 end,
+    case lists:split(N1, List) of
+	{Start, End} ->
+	    NewList = Start ++ [Value] ++ End,
+	    lists:keyreplace(Key, 1, Db, {Key, NewList});
+	_ ->
+	    {error, unknown_item}
+    end.
 
 update_list_in_db(N, Value, Db, KeyStack) ->
     lager:debug("update_list_in_db:  ~p = ~p, ~p, ~p", 
 		[N, Value, Db, KeyStack]),
     {Key, List} = find_in_db(hd(KeyStack), Db), %% Must exist ??
-    {Start, [_Remove | End]} = lists:split(N-1, List),
-    NewList = Start ++ [Value] ++ End,
-    lists:keyreplace(Key, 1, Db, {Key, NewList}).
+    case lists:split(N-1, List) of
+	{Start, [_Remove | End]} ->
+	    NewList = Start ++ [Value] ++ End,
+	    lists:keyreplace(Key, 1, Db, {Key, NewList});
+	_ ->
+	    {error, unknown_item}
+    end.
 
 show(Db, KeyStack, Output) ->
     %%lager:debug("show: ~p, ~p.", [Db, KeyStack]),
