@@ -330,6 +330,8 @@ insert([Key], Position, Value, Spec, Db, KeyStack) ->
 	    insert_item(Key, Position, Value, TS, Db, KeyStack);
 	{list_items, _, TS} ->
 	    insert_list_item(Key, Position, Value, TS, Db, KeyStack);
+	{leaf_list, Key, TS} ->
+	    insert([Key, 0], Position, Value, Spec, Db, KeyStack);
 	_O ->
 	    lager:debug("insert: unknown item ~p = ~p", [Key, _O]),
 	    {error, unknown_item}		
